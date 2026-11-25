@@ -1,6 +1,8 @@
 //! A validator node and an independent auditor.
 
-use crate::consensus::{Block, BlockHeader, QuorumCertificate, ValidatorSet, Vote, MAX_TXS_PER_BLOCK};
+use crate::consensus::{
+    Block, BlockHeader, QuorumCertificate, ValidatorSet, Vote, MAX_TXS_PER_BLOCK,
+};
 use crate::crypto::{hash, Hash, HybridKeypair};
 use crate::state::{Genesis, LedgerState, Outcome, Reject};
 use crate::tx::Transaction;
@@ -16,7 +18,11 @@ pub struct Execution {
 }
 
 /// Execute all transactions; any rejection invalidates the whole block.
-pub fn execute(state: &LedgerState, txs: &[Transaction], height: u64) -> Result<Execution, (usize, Reject)> {
+pub fn execute(
+    state: &LedgerState,
+    txs: &[Transaction],
+    height: u64,
+) -> Result<Execution, (usize, Reject)> {
     let mut s = state.clone();
     let mut outcomes = Vec::with_capacity(txs.len());
     for (i, tx) in txs.iter().enumerate() {
@@ -37,9 +43,18 @@ pub struct Node {
 impl Node {
     pub fn new(name: &str, key: HybridKeypair, genesis: Genesis) -> Self {
         genesis.validate().expect("invalid genesis");
-        let validators = ValidatorSet { keys: genesis.validators.clone() };
+        let validators = ValidatorSet {
+            keys: genesis.validators.clone(),
+        };
         let state = LedgerState::new(&genesis);
-        Self { name: name.into(), key, genesis, validators, chain: vec![], state }
+        Self {
+            name: name.into(),
+            key,
+            genesis,
+            validators,
+            chain: vec![],
+            state,
+        }
     }
 
     pub fn id(&self) -> Hash {
@@ -47,7 +62,10 @@ impl Node {
     }
 
     pub fn tip(&self) -> Hash {
-        self.chain.last().map(|b| b.header.hash()).unwrap_or_else(|| genesis_hash(&self.genesis))
+        self.chain
+            .last()
+            .map(|b| b.header.hash())
+            .unwrap_or_else(|| genesis_hash(&self.genesis))
     }
 
     pub fn next_height(&self) -> u64 {
@@ -76,19 +94,33 @@ impl Node {
             proposer: self.id(),
         };
         let proposer_signature = Block::sign_proposal(&self.key, &header);
-        (Block { header, txs, proposer_signature, qc: None }, rejected)
+        (
+            Block {
+                header,
+                txs,
+                proposer_signature,
+                qc: None,
+            },
+            rejected,
+        )
     }
 
     /// Follower: independently re-execute the proposal; vote only if every check passes.
     pub fn validate_and_vote(&self, block: &Block) -> Result<Vote, String> {
         let h = &block.header;
-        if h.chain_id != self.genesis.chain_id() || h.height != self.next_height() || h.prev != self.tip() {
+        if h.chain_id != self.genesis.chain_id()
+            || h.height != self.next_height()
+            || h.prev != self.tip()
+        {
             return Err("block does not extend this node's tip".into());
         }
         block.verify_proposal(&self.validators)?;
-        let exec = execute(&self.state, &block.txs, h.height).map_err(|(i, e)| format!("tx {i} rejected: {e}"))?;
+        let exec = execute(&self.state, &block.txs, h.height)
+            .map_err(|(i, e)| format!("tx {i} rejected: {e}"))?;
         if exec.state.root() != h.state_root {
-            return Err("state root mismatch: proposer's claimed result differs from re-execution".into());
+            return Err(
+                "state root mismatch: proposer's claimed result differs from re-execution".into(),
+            );
         }
         Ok(Vote::sign(&self.key, h))
     }
@@ -101,7 +133,8 @@ impl Node {
             return Err("block does not extend tip".into());
         }
         block.verify_proposal(&self.validators)?;
-        let exec = execute(&self.state, &block.txs, block.header.height).map_err(|(i, e)| format!("tx {i}: {e}"))?;
+        let exec = execute(&self.state, &block.txs, block.header.height)
+            .map_err(|(i, e)| format!("tx {i}: {e}"))?;
         if exec.state.root() != block.header.state_root {
             return Err("state root mismatch".into());
         }
@@ -136,10 +169,17 @@ pub struct AuditReport {
 /// state transition, so deletion, reordering, rollback or edits are detected.
 pub fn audit(genesis: &Genesis, chain: &[Block]) -> Result<AuditReport, String> {
     genesis.validate()?;
-    let vs = ValidatorSet { keys: genesis.validators.clone() };
+    let vs = ValidatorSet {
+        keys: genesis.validators.clone(),
+    };
     let mut state = LedgerState::new(genesis);
     let mut prev = genesis_hash(genesis);
-    let mut report = AuditReport { blocks: 0, transactions: 0, exceptions: vec![], final_state_root: state.root() };
+    let mut report = AuditReport {
+        blocks: 0,
+        transactions: 0,
+        exceptions: vec![],
+        final_state_root: state.root(),
+    };
     for (i, b) in chain.iter().enumerate() {
         let h = &b.header;
         let at = |m: String| format!("block {}: {m}", i + 1);
@@ -150,8 +190,12 @@ pub fn audit(genesis: &Genesis, chain: &[Block]) -> Result<AuditReport, String> 
             return Err(at("hash link broken (history edited or removed)".into()));
         }
         b.verify_proposal(&vs).map_err(at)?;
-        b.qc.as_ref().ok_or_else(|| at("missing quorum certificate".into()))?.verify(h, &vs).map_err(at)?;
-        let exec = execute(&state, &b.txs, h.height).map_err(|(t, e)| at(format!("tx {t} invalid: {e}")))?;
+        b.qc.as_ref()
+            .ok_or_else(|| at("missing quorum certificate".into()))?
+            .verify(h, &vs)
+            .map_err(at)?;
+        let exec = execute(&state, &b.txs, h.height)
+            .map_err(|(t, e)| at(format!("tx {t} invalid: {e}")))?;
         if exec.state.root() != h.state_root {
             return Err(at("state root mismatch".into()));
         }
@@ -167,4 +211,32 @@ pub fn audit(genesis: &Genesis, chain: &[Block]) -> Result<AuditReport, String> 
     }
     report.final_state_root = state.root();
     Ok(report)
+}
+
+const EXPORT_MAGIC: &str = "VERIFY-CHAIN-EXPORT/v1";
+/// Upper bound on blocks in one export file.
+pub const MAX_EXPORT_BLOCKS: usize = 1 << 24;
+
+/// Self-contained, independently verifiable export (§6.3, §6.5): the genesis
+/// plus every certified block, in canonical encoding. Anyone holding the
+/// published chain id can check it with `verify-audit` and no other trust.
+pub fn export_chain(genesis: &Genesis, chain: &[Block]) -> Vec<u8> {
+    use crate::codec::{Canonical, Enc};
+    let mut e = Enc::new();
+    e.str(EXPORT_MAGIC);
+    genesis.encode(&mut e);
+    e.list(chain);
+    e.finish()
+}
+
+pub fn import_chain(bytes: &[u8]) -> Result<(Genesis, Vec<Block>), crate::codec::DecodeError> {
+    use crate::codec::{derr, Dec, Decode};
+    let mut d = Dec::new(bytes);
+    if d.str()? != EXPORT_MAGIC {
+        return derr("not a VERIFY chain export");
+    }
+    let genesis = Genesis::decode(&mut d)?;
+    let blocks = d.list(MAX_EXPORT_BLOCKS)?;
+    d.finish()?;
+    Ok((genesis, blocks))
 }

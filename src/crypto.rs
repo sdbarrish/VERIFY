@@ -86,7 +86,12 @@ pub struct HybridSignature {
 
 impl fmt::Debug for HybridSignature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "HybridSignature(suite={:#06x}, {} bytes)", self.suite, self.ed25519.len() + self.mldsa65.len())
+        write!(
+            f,
+            "HybridSignature(suite={:#06x}, {} bytes)",
+            self.suite,
+            self.ed25519.len() + self.mldsa65.len()
+        )
     }
 }
 
@@ -107,7 +112,9 @@ pub enum SigError {
 impl fmt::Display for SigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SigError::UnsupportedSuite(s) => write!(f, "unsupported or downgraded signature suite {s:#06x}"),
+            SigError::UnsupportedSuite(s) => {
+                write!(f, "unsupported or downgraded signature suite {s:#06x}")
+            }
             SigError::Malformed => write!(f, "malformed key or signature"),
             SigError::ClassicalInvalid => write!(f, "Ed25519 half of hybrid signature invalid"),
             SigError::PostQuantumInvalid => write!(f, "ML-DSA-65 half of hybrid signature invalid"),
@@ -160,7 +167,10 @@ impl HybridKeypair {
     pub fn sign(&self, domain: &str, msg: &[u8]) -> HybridSignature {
         let input = signing_input(SUITE_HYBRID_ED25519_MLDSA65, domain, msg);
         let ed_sig = self.ed.sign(&input);
-        let pq_sig = self.pq.try_sign(&input, MLDSA_CTX).expect("ML-DSA signing failed");
+        let pq_sig = self
+            .pq
+            .try_sign(&input, MLDSA_CTX)
+            .expect("ML-DSA signing failed");
         HybridSignature {
             suite: SUITE_HYBRID_ED25519_MLDSA65,
             ed25519: ed_sig.to_bytes().to_vec(),
@@ -170,7 +180,12 @@ impl HybridKeypair {
 }
 
 /// Verify a hybrid signature. Both halves must be valid; there is no fallback.
-pub fn verify(pk: &HybridPublicKey, domain: &str, msg: &[u8], sig: &HybridSignature) -> Result<(), SigError> {
+pub fn verify(
+    pk: &HybridPublicKey,
+    domain: &str,
+    msg: &[u8],
+    sig: &HybridSignature,
+) -> Result<(), SigError> {
     if pk.suite != SUITE_HYBRID_ED25519_MLDSA65 {
         return Err(SigError::UnsupportedSuite(pk.suite));
     }
@@ -180,14 +195,26 @@ pub fn verify(pk: &HybridPublicKey, domain: &str, msg: &[u8], sig: &HybridSignat
     let input = signing_input(sig.suite, domain, msg);
 
     let ed_pk = VerifyingKey::from_bytes(&pk.ed25519).map_err(|_| SigError::Malformed)?;
-    let ed_bytes: [u8; 64] = sig.ed25519.as_slice().try_into().map_err(|_| SigError::Malformed)?;
+    let ed_bytes: [u8; 64] = sig
+        .ed25519
+        .as_slice()
+        .try_into()
+        .map_err(|_| SigError::Malformed)?;
     ed_pk
         .verify_strict(&input, &EdSignature::from_bytes(&ed_bytes))
         .map_err(|_| SigError::ClassicalInvalid)?;
 
-    let pk_bytes: [u8; ml_dsa_65::PK_LEN] = pk.mldsa65.as_slice().try_into().map_err(|_| SigError::Malformed)?;
+    let pk_bytes: [u8; ml_dsa_65::PK_LEN] = pk
+        .mldsa65
+        .as_slice()
+        .try_into()
+        .map_err(|_| SigError::Malformed)?;
     let pq_pk = ml_dsa_65::PublicKey::try_from_bytes(pk_bytes).map_err(|_| SigError::Malformed)?;
-    let sig_bytes: [u8; ml_dsa_65::SIG_LEN] = sig.mldsa65.as_slice().try_into().map_err(|_| SigError::Malformed)?;
+    let sig_bytes: [u8; ml_dsa_65::SIG_LEN] = sig
+        .mldsa65
+        .as_slice()
+        .try_into()
+        .map_err(|_| SigError::Malformed)?;
     if !pq_pk.verify(&input, &sig_bytes, MLDSA_CTX) {
         return Err(SigError::PostQuantumInvalid);
     }
@@ -204,7 +231,10 @@ pub struct CommitmentOpening {
 
 impl CommitmentOpening {
     pub fn new(value: &[u8]) -> Self {
-        Self { salt: random_32(), value: value.to_vec() }
+        Self {
+            salt: random_32(),
+            value: value.to_vec(),
+        }
     }
     pub fn commitment(&self) -> Hash {
         let mut e = Enc::new();
@@ -213,5 +243,25 @@ impl CommitmentOpening {
     }
     pub fn opens(&self, c: &Hash) -> bool {
         &self.commitment() == c
+    }
+}
+
+impl crate::codec::Decode for HybridPublicKey {
+    fn decode(d: &mut crate::codec::Dec<'_>) -> Result<Self, crate::codec::DecodeError> {
+        Ok(Self {
+            suite: d.u16()?,
+            ed25519: d.fixed()?,
+            mldsa65: d.bytes()?,
+        })
+    }
+}
+
+impl crate::codec::Decode for HybridSignature {
+    fn decode(d: &mut crate::codec::Dec<'_>) -> Result<Self, crate::codec::DecodeError> {
+        Ok(Self {
+            suite: d.u16()?,
+            ed25519: d.bytes()?,
+            mldsa65: d.bytes()?,
+        })
     }
 }

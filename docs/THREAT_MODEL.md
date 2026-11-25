@@ -9,7 +9,8 @@ A future cryptographically relevant quantum computer breaks Ed25519 and other el
 - Signatures: every authorizing signature also carries ML-DSA-65 (FIPS 204, NIST category 3), and verification requires it. Forging an approval, a proposal or a vote needs an ML-DSA forgery.
 - Hashes: SHA3-256 keeps about 128-bit preimage security under Grover.
 - **Harvest-now-forge-later:** the ledger's integrity rests on hybrid signatures from day one, so recorded history stays unforgeable after classical signatures fall.
-- **Not yet covered:** confidentiality of transport and payloads. ML-KEM is on the roadmap and nothing confidential is stored on the ledger today. Archives still need re-anchoring if ML-DSA itself is weakened (§6.2).
+- **Harvest-now-decrypt-later:** confidential evidence is sealed with hybrid X25519 + ML-KEM-768, so it stays secret unless both schemes are broken (`tests/envelope.rs`).
+- **Not yet covered:** validator-to-validator transport, because there is no networking yet. Archives still need re-anchoring if ML-DSA itself is weakened (§6.2).
 
 ## What "AI resistant" means here
 
@@ -22,7 +23,7 @@ No system is AI-proof. This design uses a concrete threat list and gives a mitig
 | Adversarial inputs, poisoning or prompt injection against a detector | There is no ML in validation or consensus. Validity is deterministic rule evaluation, and every honest node computes the same answer | all state tests |
 | AI-accelerated brute force of low-entropy identifiers | Values are committed with 256-bit salts, and only commitments are on the ledger | `commitments_hide_low_entropy_values` |
 | AI-assisted fabrication of plausible records or history | Records need valid hybrid signatures, links to their predecessors, and quorum certificates. The independent auditor detects any edit | `auditor_verifies_honest_chain_and_detects_tampering` |
-| AI-assisted discovery of implementation bugs | Rust with `forbid(unsafe_code)`, bounded inputs, explicit errors, one canonical codec, and narrow modules. **Fuzzing and independent review are still required** | roadmap |
+| AI-assisted discovery of implementation bugs | Rust with `forbid(unsafe_code)`, bounded inputs, explicit errors, one strict canonical codec, randomized robustness tests, and CI on every push. **Coverage-guided fuzzing and independent review are still required** | `tests/robustness.rs` |
 
 ## Controls by threat (§8.1)
 
@@ -42,6 +43,10 @@ No system is AI-proof. This design uses a concrete threat list and gives a mitig
 | Under-signed or forged certificate | Requires n−f distinct, valid votes | `certificates_need_a_quorum_of_distinct_valid_votes` |
 | Validator equivocation | Verifiable evidence | `equivocation_produces_verifiable_evidence` |
 | Edited, deleted, reordered or re-signed history | Independent full replay | `auditor_verifies_honest_chain_and_detects_tampering` |
+| Malformed or hostile input bytes | Strict bounded decoder, no panics, no oversized allocations | `random_bytes_never_panic_the_decoders`, `every_truncation_and_extension_is_rejected` |
+| Silent corruption or tampering of an exported chain | Every byte is covered by a hash or signature, and the standalone auditor replays everything | `any_single_bit_flip_is_detected`, `export_round_trips_exactly_and_audits` |
+| Fake chain substituted wholesale | Auditor checks the chain ID against the value published out of band | `verify-audit --expect-chain-id` |
+| Evidence read or redirected in transit | Hybrid KEM + AEAD; signed outer envelope checked before decryption | `round_trip_and_addressing`, `any_modification_is_detected` |
 | Validator/official key reuse | Rejected at genesis and at policy activation | `policy_cannot_grant_ai_a_role_or_reuse_validator_keys` |
 
 ## Out of scope / residual risk

@@ -10,6 +10,8 @@
 //!   validating by a CORE invariant no policy can override; consensus and
 //!   validation are deterministic rule checks, not heuristics; low-entropy
 //!   values are committed with 256-bit salts; all authority is multi-party.
+//! * **Quantum-safe confidentiality**: evidence envelopes use hybrid
+//!   X25519 + ML-KEM-768 (FIPS 203) key establishment and ChaCha20-Poly1305.
 //! * **Election-specific**: jurisdiction policy objects, m-of-n custody
 //!   transitions, ballot reconciliation with quarantine, and 3-of-3
 //!   independent emergency correction that appends rather than rewrites.
@@ -22,6 +24,7 @@
 pub mod codec;
 pub mod consensus;
 pub mod crypto;
+pub mod envelope;
 pub mod merkle;
 pub mod node;
 pub mod policy;

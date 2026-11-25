@@ -28,6 +28,7 @@ This document maps the prototype to the VERIFY Master White Paper (Rev 1.0, 25 N
 | Hash | SHA3-256 | Each use has its own domain tag: `key-id`, `tx`, `block`, `vote`, `proposal`, `policy`, `state-root`, `merkle/leaf`, `merkle/node`, `commitment`, `chain-id`. |
 | Commitments | `H(salt₂₅₆ ‖ value)` | The opening stays with the custodian, and only the commitment goes on the ledger. |
 | Key IDs | `H(canonical public key)` | Binds the suite and both public keys. |
+| Confidential evidence | X25519 **AND** ML-KEM-768, ChaCha20-Poly1305 | Key = SHA3(`ss_x25519 ‖ ss_mlkem ‖ eph ‖ kem_ct ‖ recipient_id`), an X-Wing-style combiner. The AEAD's associated data is the whole header. The sender's hybrid signature covers header + ciphertext digest and is checked **before** decryption. Recipients' KEM keys are separate from their signing keys. |
 
 **Downgrade resistance:** this build accepts exactly one suite, `0x0101`. The suite ID is inside the signed bytes, so altering it invalidates both halves.
 
@@ -72,7 +73,22 @@ The payload is one of: `ActivatePolicy`, `CommenceElection`, `RegisterBatch`, `C
 
 **Not yet implemented:** peer-to-peer networking, view change and timeouts (liveness under a faulty leader), validator set reconfiguration, and slashing or removal flows. A production design would adopt a published protocol such as HotStuff-2 or Tendermint for these and keep the existing safety core and hybrid signatures.
 
-## 6. Mapping to the white paper's open decisions (§10.2)
+## 6. Export and independent audit
+
+`export_chain` writes `"VERIFY-CHAIN-EXPORT/v1" ‖ genesis ‖ blocks` in canonical encoding. `import_chain` is strict:
+
+- Every length is bounded by the remaining input before anything is allocated.
+- Tags and booleans must take one of their defined values.
+- Strings must be valid UTF-8.
+- Trailing bytes are rejected.
+
+As a result, decode-then-encode reproduces the file byte for byte (tested), so there is never a second encoding of the same history.
+
+Trust comes from the **chain ID**, which is the hash of the genesis. The election authority publishes it through a separate channel, such as a public notice or a signed press release. `verify-audit --expect-chain-id` then needs no other trust.
+
+**Storage cost:** post-quantum signatures are large. ML-DSA-65 signatures are 3,309 bytes, and with four votes per block the demo chain of 29 blocks and 21 transactions exports to about 0.74 MB. That suits custody events, which number in the thousands to millions per election, not per second. Benchmarking at realistic scale is still to do (§6.2).
+
+## 7. Mapping to the white paper's open decisions (§10.2)
 
 | Open decision | Prototype choice | Status |
 |---|---|---|
@@ -82,11 +98,18 @@ The payload is one of: `ActivatePolicy`, `CommenceElection`, `RegisterBatch`, `C
 | Legal role thresholds | 2-of-3 / 3-of-4 / 3-of-5 from §4.2 as an illustrative policy | Policy data, not code; per jurisdiction |
 | Retention | Not modelled | Open |
 
-## 7. Roadmap
+## 8. Roadmap
 
+Done:
+- ML-KEM-768 hybrid envelopes for confidential evidence.
+- Strict decoder, chain export and standalone auditor.
+- Randomized robustness tests.
+- CI.
+
+Next:
 1. Swap the demo seeds for HSM-backed keys and a documented key ceremony. SLH-DSA (FIPS 205) is the candidate for long-lived root keys.
-2. Add ML-KEM-768 (FIPS 203) hybrid key establishment for confidential payloads and validator transport.
-3. Networking with view change, using a published BFT protocol.
-4. Persistent storage, checkpoints, and independent witness checkpoints exported to separate operators.
-5. A sanitized, one-way export path for certified historical data feeding the isolated AI gateway (§8.4), with no reverse API.
-6. Fuzzing of the codec and state machine, property tests, reproducible builds and signed releases (§6.4).
+2. Networking with view change, using a published BFT protocol. Validator transport would reuse the hybrid KEM.
+3. Persistent storage, checkpoints, and independent witness checkpoints held by separate operators.
+4. A sanitized, one-way export path for certified historical data feeding the isolated AI gateway (§8.4), with no reverse API.
+5. Coverage-guided fuzzing (cargo-fuzz) of the codec and state machine, reproducible builds and signed releases (§6.4).
+6. A formal requirements and threat-model package for the simulated custody workflow (§10.4).

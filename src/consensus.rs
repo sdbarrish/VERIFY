@@ -13,7 +13,9 @@
 //! out of scope for the prototype; see docs/ARCHITECTURE.md.
 
 use crate::codec::{Canonical, Enc};
-use crate::crypto::{hash, short, verify, Hash, HybridKeypair, HybridPublicKey, HybridSignature, KeyId};
+use crate::crypto::{
+    hash, short, verify, Hash, HybridKeypair, HybridPublicKey, HybridSignature, KeyId,
+};
 use crate::merkle;
 use crate::tx::Transaction;
 use std::collections::BTreeSet;
@@ -42,7 +44,9 @@ impl ValidatorSet {
     }
     /// Deterministic round-robin leader schedule.
     pub fn leader(&self, height: u64, round: u32) -> KeyId {
-        let i = (height as usize + round as usize) % self.n();
+        // Modular arithmetic first: hostile heights or rounds must not overflow.
+        let n = self.n() as u64;
+        let i = ((height % n + round as u64 % n) % n) as usize;
         self.keys[i].id()
     }
 }
@@ -61,8 +65,14 @@ pub struct BlockHeader {
 
 impl Canonical for BlockHeader {
     fn encode(&self, e: &mut Enc) {
-        e.hash(&self.chain_id).u64(self.height).u32(self.round).hash(&self.prev);
-        e.hash(&self.tx_root).u32(self.tx_count).hash(&self.state_root).hash(&self.proposer);
+        e.hash(&self.chain_id)
+            .u64(self.height)
+            .u32(self.round)
+            .hash(&self.prev);
+        e.hash(&self.tx_root)
+            .u32(self.tx_count)
+            .hash(&self.state_root)
+            .hash(&self.proposer);
     }
 }
 
@@ -97,13 +107,22 @@ impl Vote {
             round: h.round,
             block,
             validator: key.id(),
-            signature: key.sign(VOTE_DOMAIN, &vote_message(&h.chain_id, h.height, h.round, &block)),
+            signature: key.sign(
+                VOTE_DOMAIN,
+                &vote_message(&h.chain_id, h.height, h.round, &block),
+            ),
         }
     }
 
     pub fn verify(&self, vs: &ValidatorSet) -> bool {
         match vs.get(&self.validator) {
-            Some(pk) => verify(pk, VOTE_DOMAIN, &vote_message(&self.chain_id, self.height, self.round, &self.block), &self.signature).is_ok(),
+            Some(pk) => verify(
+                pk,
+                VOTE_DOMAIN,
+                &vote_message(&self.chain_id, self.height, self.round, &self.block),
+                &self.signature,
+            )
+            .is_ok(),
             None => false,
         }
     }
@@ -120,18 +139,32 @@ impl QuorumCertificate {
         let want = h.hash();
         let mut signers = BTreeSet::new();
         for v in &self.votes {
-            if v.chain_id != h.chain_id || v.height != h.height || v.round != h.round || v.block != want {
-                return Err(format!("vote from {} is for a different block", short(&v.validator)));
+            if v.chain_id != h.chain_id
+                || v.height != h.height
+                || v.round != h.round
+                || v.block != want
+            {
+                return Err(format!(
+                    "vote from {} is for a different block",
+                    short(&v.validator)
+                ));
             }
             if !v.verify(vs) {
-                return Err(format!("invalid vote signature from {}", short(&v.validator)));
+                return Err(format!(
+                    "invalid vote signature from {}",
+                    short(&v.validator)
+                ));
             }
             if !signers.insert(v.validator) {
                 return Err("duplicate vote in certificate".into());
             }
         }
         if signers.len() < vs.quorum() {
-            return Err(format!("{} votes, quorum is {}", signers.len(), vs.quorum()));
+            return Err(format!(
+                "{} votes, quorum is {}",
+                signers.len(),
+                vs.quorum()
+            ));
         }
         Ok(())
     }
@@ -149,7 +182,10 @@ impl Block {
     /// Leaves commit to the full signed transaction, approvals included, so
     /// the signature set is covered by the block hash and the quorum certificate.
     pub fn tx_root(txs: &[Transaction]) -> Hash {
-        let leaves: Vec<Hash> = txs.iter().map(|t| merkle::leaf_hash(&t.to_canonical())).collect();
+        let leaves: Vec<Hash> = txs
+            .iter()
+            .map(|t| merkle::leaf_hash(&t.to_canonical()))
+            .collect();
         merkle::root(&leaves)
     }
 
@@ -167,8 +203,16 @@ impl Block {
         if self.header.proposer != vs.leader(self.header.height, self.header.round) {
             return Err("proposer is not the scheduled leader".into());
         }
-        let pk = vs.get(&self.header.proposer).ok_or("proposer is not a validator")?;
-        verify(pk, PROPOSAL_DOMAIN, &self.header.hash(), &self.proposer_signature).map_err(|e| format!("proposer signature: {e}"))
+        let pk = vs
+            .get(&self.header.proposer)
+            .ok_or("proposer is not a validator")?;
+        verify(
+            pk,
+            PROPOSAL_DOMAIN,
+            &self.header.hash(),
+            &self.proposer_signature,
+        )
+        .map_err(|e| format!("proposer signature: {e}"))
     }
 }
 
@@ -182,7 +226,102 @@ pub struct EquivocationEvidence {
 
 impl EquivocationEvidence {
     pub fn check(a: &Vote, b: &Vote, vs: &ValidatorSet) -> Option<Self> {
-        let conflicting = a.validator == b.validator && a.chain_id == b.chain_id && a.height == b.height && a.round == b.round && a.block != b.block;
-        (conflicting && a.verify(vs) && b.verify(vs)).then(|| Self { a: a.clone(), b: b.clone() })
+        let conflicting = a.validator == b.validator
+            && a.chain_id == b.chain_id
+            && a.height == b.height
+            && a.round == b.round
+            && a.block != b.block;
+        (conflicting && a.verify(vs) && b.verify(vs)).then(|| Self {
+            a: a.clone(),
+            b: b.clone(),
+        })
+    }
+}
+
+use crate::codec::{derr, Dec, Decode, DecodeError};
+
+impl Canonical for Vote {
+    fn encode(&self, e: &mut Enc) {
+        e.hash(&self.chain_id)
+            .u64(self.height)
+            .u32(self.round)
+            .hash(&self.block)
+            .hash(&self.validator);
+        self.signature.encode(e);
+    }
+}
+
+impl Canonical for QuorumCertificate {
+    fn encode(&self, e: &mut Enc) {
+        e.list(&self.votes);
+    }
+}
+
+impl Canonical for Block {
+    fn encode(&self, e: &mut Enc) {
+        self.header.encode(e);
+        e.list(&self.txs);
+        self.proposer_signature.encode(e);
+        match &self.qc {
+            None => {
+                e.u8(0);
+            }
+            Some(qc) => {
+                e.u8(1);
+                qc.encode(e);
+            }
+        }
+    }
+}
+
+/// Upper bound on validators (and so votes per certificate).
+pub const MAX_VALIDATORS: usize = 256;
+
+impl Decode for BlockHeader {
+    fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            chain_id: d.hash()?,
+            height: d.u64()?,
+            round: d.u32()?,
+            prev: d.hash()?,
+            tx_root: d.hash()?,
+            tx_count: d.u32()?,
+            state_root: d.hash()?,
+            proposer: d.hash()?,
+        })
+    }
+}
+
+impl Decode for Vote {
+    fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            chain_id: d.hash()?,
+            height: d.u64()?,
+            round: d.u32()?,
+            block: d.hash()?,
+            validator: d.hash()?,
+            signature: HybridSignature::decode(d)?,
+        })
+    }
+}
+
+impl Decode for Block {
+    fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
+        let header = BlockHeader::decode(d)?;
+        let txs = d.list(MAX_TXS_PER_BLOCK)?;
+        let proposer_signature = HybridSignature::decode(d)?;
+        let qc = match d.u8()? {
+            0 => None,
+            1 => Some(QuorumCertificate {
+                votes: d.list(MAX_VALIDATORS)?,
+            }),
+            t => return derr(format!("bad certificate tag {t}")),
+        };
+        Ok(Self {
+            header,
+            txs,
+            proposer_signature,
+            qc,
+        })
     }
 }

@@ -56,7 +56,13 @@ pub fn inclusion_proof(index: usize, leaves: &[Hash]) -> Vec<Hash> {
 }
 
 /// RFC 9162 §2.1.3.2 verification.
-pub fn verify_inclusion(index: usize, tree_size: usize, leaf: &Hash, proof: &[Hash], expected_root: &Hash) -> bool {
+pub fn verify_inclusion(
+    index: usize,
+    tree_size: usize,
+    leaf: &Hash,
+    proof: &[Hash],
+    expected_root: &Hash,
+) -> bool {
     if index >= tree_size {
         return false;
     }
