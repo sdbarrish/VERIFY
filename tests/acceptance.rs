@@ -567,3 +567,155 @@ fn commitments_hide_low_entropy_values() {
     assert!(a.opens(&a.commitment()));
     assert!(!a.opens(&b.commitment()));
 }
+
+// §2.3 FR-04 — no custody activity before the configuration is locked.
+#[test]
+fn custody_requires_commencement() {
+    let mut net = Network::new();
+    let p = net.tx(
+        &["root-county", "root-state"],
+        Payload::ActivatePolicy(reference_policy()),
+        None,
+    );
+    assert_eq!(net.submit_one(p), Ok(Outcome::Applied));
+    let reg = net.tx(
+        &["warehouse-1", "warehouse-2"],
+        Payload::RegisterBatch {
+            batch_id: "PCT-0001".into(),
+            ballot_style: "BS-07".into(),
+            quantity: 10,
+            inventory_commitment: [1; 32],
+            seal_commitment: [2; 32],
+        },
+        None,
+    );
+    assert!(
+        matches!(net.submit_one(reg), Err(Reject::PolicyViolation(m)) if m.contains("not commenced"))
+    );
+}
+
+// §6.1 SR-11 — the origin must approve, and approvers must be distinct.
+#[test]
+fn origin_must_approve_and_approvers_are_distinct() {
+    let mut net = Network::new();
+    net.bootstrap();
+    net.register("PCT-0001", 500);
+    let pred = net.batch_tip("PCT-0001");
+    let payload = Payload::CustodyTransfer {
+        batch_id: "PCT-0001".into(),
+        from: "Produced".into(),
+        to: "WarehouseSealed".into(),
+        seal_intact: true,
+        evidence_commitment: [3; 32],
+    };
+    let absent_origin = net
+        .body("warehouse-1", payload.clone(), Some(pred))
+        .approve(&demo_key("warehouse-2"))
+        .approve(&demo_key("warehouse-3"));
+    assert!(
+        matches!(net.submit_one(absent_origin), Err(Reject::Malformed(m)) if m.contains("origin"))
+    );
+
+    let w1 = demo_key("warehouse-1");
+    let doubled = net
+        .body("warehouse-1", payload, Some(pred))
+        .approve(&w1)
+        .approve(&w1);
+    assert!(
+        matches!(net.submit_one(doubled), Err(Reject::Malformed(m)) if m.contains("duplicate"))
+    );
+}
+
+// §4.3 FR-14 — nobody may approve the correction of a transaction they approved.
+#[test]
+fn correction_cannot_be_approved_by_an_original_signer() {
+    let mut net = Network::new();
+    let mut p = reference_policy();
+    // A jurisdiction where the county supervisor also sits on reconciliation.
+    p.reconciliation =
+        verify_chain::policy::ApprovalRule::new(&["canvassing_board", "county_supervisor"], 3, 1);
+    let tx = net.tx(
+        &["root-county", "root-state"],
+        Payload::ActivatePolicy(p),
+        None,
+    );
+    assert_eq!(net.submit_one(tx), Ok(Outcome::Applied));
+    let tx = net.tx(
+        &["root-county", "root-independent"],
+        Payload::CommenceElection,
+        None,
+    );
+    assert_eq!(net.submit_one(tx), Ok(Outcome::Applied));
+    net.register("PCT-0004", 100);
+    walk_to_secure_storage(&mut net, "PCT-0004");
+
+    let pred = net.batch_tip("PCT-0004");
+    let report = Reconciliation {
+        supplied: 100,
+        cast: 90,
+        unused: 9,
+        ..Default::default()
+    };
+    let recon = net.tx(
+        &["county-soe", "canvass-1", "canvass-2"],
+        Payload::Reconcile {
+            batch_id: "PCT-0004".into(),
+            report,
+        },
+        Some(pred),
+    );
+    let recon_id = recon.id();
+    assert!(matches!(net.submit_one(recon), Ok(Outcome::Exception(_))));
+
+    let pred = net.batch_tip("PCT-0004");
+    let fix = net.tx(
+        &["county-soe", "state-doe", "ieoa-external"],
+        Payload::EmergencyCorrection {
+            batch_id: "PCT-0004".into(),
+            original_tx: recon_id,
+            corrected_state: "SecureStorage".into(),
+            reason: "recount".into(),
+            legal_authority: "order 1".into(),
+            evidence_commitment: [4; 32],
+        },
+        Some(pred),
+    );
+    assert!(
+        matches!(net.submit_one(fix), Err(Reject::ConflictOfInterest(m)) if m.contains("county-soe"))
+    );
+    assert!(
+        net.nodes[0].state.batches["PCT-0004"].quarantined,
+        "batch stays quarantined"
+    );
+}
+
+// §4.3 FR-13 — a quarantined batch cannot be reconciled over.
+#[test]
+fn quarantined_batch_rejects_reconciliation() {
+    let mut net = Network::new();
+    net.bootstrap();
+    net.register("PCT-0005", 100);
+    let tx = net.transfer_tx(
+        "PCT-0005",
+        "Produced",
+        "WarehouseSealed",
+        &["warehouse-1", "warehouse-2"],
+        false,
+    );
+    assert!(matches!(net.submit_one(tx), Ok(Outcome::Exception(_))));
+    let pred = net.batch_tip("PCT-0005");
+    let report = Reconciliation {
+        supplied: 100,
+        unused: 100,
+        ..Default::default()
+    };
+    let tx = net.tx(
+        &["canvass-1", "canvass-2", "canvass-3"],
+        Payload::Reconcile {
+            batch_id: "PCT-0005".into(),
+            report,
+        },
+        Some(pred),
+    );
+    assert!(matches!(net.submit_one(tx), Err(Reject::Quarantined(_))));
+}

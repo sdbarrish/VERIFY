@@ -20,7 +20,7 @@ It records election custody evidence, not votes. No transaction type can express
 ## Quick start
 
 ```bash
-cargo test --release                                     # 23 tests
+cargo test --release                                     # 27 tests
 cargo run --release --bin verify-sim -- --export chain.verify
 cargo run --release --bin verify-audit -- chain.verify --expect-chain-id <id printed by the simulator>
 ```
