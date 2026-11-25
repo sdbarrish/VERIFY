@@ -2,7 +2,7 @@
 name = "verify-chain"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.82"
 description = "VERIFY ledger prototype: permissioned BFT chain with hybrid post-quantum signatures, custody policy enforcement and protocol-level AI isolation"
 license = "UNLICENSED"
 publish = false

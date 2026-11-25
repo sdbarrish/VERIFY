@@ -41,7 +41,9 @@ No system is AI-proof. This design uses a concrete threat list and gives a mitig
 | Broken seal | Recorded as an exception, batch quarantined | `broken_seal_is_recorded_and_quarantines` |
 | Byzantine leader forges result | Validators re-execute and compare state roots | `byzantine_leader_cannot_forge_state` |
 | Under-signed or forged certificate | Requires n−f distinct, valid votes | `certificates_need_a_quorum_of_distinct_valid_votes` |
-| Validator equivocation | Verifiable evidence | `equivocation_produces_verifiable_evidence` |
+| Validator equivocation | Verifiable evidence | `equivocation_produces_verifiable_evidence`, `byzantine_equivocator_never_breaks_agreement` |
+| Conflicting blocks committed across rounds | Lock rule, n−f quorum overlap | `locked_validator_refuses_conflicting_block_until_newer_polka`, `safety_holds_under_heavy_asynchrony`, `seven_validators_tolerate_two_byzantine` |
+| Crashed or silent leader, lost quorum, partition | Timeouts, view change, durable recovery, catch-up | `crashed_leader_is_replaced_by_view_change`, `f_plus_one_down_halts_safely_then_resumes_with_catch_up`, `even_partition_stops_commits_then_heals`, `recovered_node_catches_up_from_peers` |
 | Edited, deleted, reordered or re-signed history | Independent full replay | `auditor_verifies_honest_chain_and_detects_tampering` |
 | Malformed or hostile input bytes | Strict bounded decoder, no panics, no oversized allocations | `random_bytes_never_panic_the_decoders`, `every_truncation_and_extension_is_rejected` |
 | Silent corruption or tampering of an exported chain | Every byte is covered by a hash or signature, and the standalone auditor replays everything | `any_single_bit_flip_is_detected`, `export_round_trips_exactly_and_audits` |
@@ -56,7 +58,7 @@ These items are not addressed by the prototype. Nothing on this list is claimed 
 - More than f colluding validators, or more than the threshold of colluding officials. Independence is an organizational property.
 - Key theft from endpoints. HSMs and authenticators (§3.2) are not modelled.
 - Coercion, vote buying, false source data and physical destruction (§8.1). The ledger proves who signed, not what is physically true.
-- Liveness and denial of service: no networking, view change or rate limiting yet.
+- Liveness is shown on a simulated network only. Real transport, gossip rate limiting and denial-of-service resistance are not built yet.
 - Metadata linkage from timing (§3.1).
 - Completeness: Merkle inclusion proves membership only. Completeness comes from reconciliation against physical inventory.
 - Demo keys are derived from public seeds and are **for simulation only**.

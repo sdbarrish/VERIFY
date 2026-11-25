@@ -1,6 +1,7 @@
 //! Simulated custody workflow (white paper §10.4 "next deliverable").
 //! Run: cargo run --release --bin verify-sim [-- --export chain.verify]
 
+use verify_chain::bft::{Outage, Partition, SimConfig, SimNet};
 use verify_chain::consensus::{Block, EquivocationEvidence, Vote};
 use verify_chain::crypto::short;
 use verify_chain::envelope::{Envelope, KemKeypair};
@@ -355,4 +356,102 @@ fn main() {
         Ok(_) => println!("  [MISSED]    deletion was not detected"),
         Err(e) => println!("  [DETECTED]  Someone deletes block 3\n              -> {e}"),
     }
+
+    consensus_under_faults();
+}
+
+fn fault_run(label: &str, validators: usize, cfg: SimConfig, settle: u64) {
+    let mut net = Network::with_validators(validators);
+    let mut txs = net.bootstrap_txs();
+    txs.push(net.register_tx("PCT-0100", 5_000));
+    let mut s: SimNet = net.into_sim(cfg);
+    for t in txs {
+        s.submit(t);
+    }
+    s.run_until(settle);
+    let reached = s.run_until_height(5, settle + 120_000);
+    let agree = s.check_agreement().is_ok();
+    let max_round = s
+        .replicas
+        .iter()
+        .flat_map(|r| r.node.chain.iter())
+        .filter_map(|b| b.qc.as_ref().map(|q| q.votes[0].round))
+        .max()
+        .unwrap_or(0);
+    let evidence: usize = s.honest().map(|r| r.evidence.len()).sum();
+    println!(
+        "  [{}]  {label}\n              {} honest validators agree: {agree}; 5 blocks final by t={}; highest round used {max_round}; equivocation proofs {evidence}",
+        if reached && agree { "LIVE+SAFE" } else { "FAILED   " },
+        s.honest().count(),
+        s.now
+    );
+}
+
+fn consensus_under_faults() {
+    section("Consensus under faults (simulated network, round-based BFT with locking)");
+    fault_run("All honest, random delays 5-60", 4, SimConfig::default(), 0);
+    fault_run(
+        "Leader of height 1 crashed for good: view change",
+        4,
+        SimConfig {
+            outages: vec![Outage {
+                node: 1,
+                from: 0,
+                until: None,
+            }],
+            ..Default::default()
+        },
+        0,
+    );
+    fault_run(
+        "2|2 network partition until t=4000, then heals",
+        4,
+        SimConfig {
+            partitions: vec![Partition {
+                groups: vec![vec![0, 1], vec![2, 3]],
+                from: 0,
+                until: 4_000,
+            }],
+            ..Default::default()
+        },
+        4_000,
+    );
+    fault_run(
+        "Two of four down (no quorum) until one returns at t=5000",
+        4,
+        SimConfig {
+            outages: vec![
+                Outage {
+                    node: 2,
+                    from: 0,
+                    until: None,
+                },
+                Outage {
+                    node: 3,
+                    from: 0,
+                    until: Some(5_000),
+                },
+            ],
+            ..Default::default()
+        },
+        5_000,
+    );
+    fault_run(
+        "Byzantine leader equivocates (f = 1 of 4)",
+        4,
+        SimConfig {
+            byzantine: vec![1],
+            ..Default::default()
+        },
+        0,
+    );
+    fault_run(
+        "Seven validators, two Byzantine (f = 2)",
+        7,
+        SimConfig {
+            byzantine: vec![1, 4],
+            ..Default::default()
+        },
+        0,
+    );
 }

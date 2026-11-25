@@ -72,8 +72,21 @@ impl Node {
         self.chain.len() as u64 + 1
     }
 
+    pub(crate) fn key(&self) -> &HybridKeypair {
+        &self.key
+    }
+
     /// Leader: drop invalid transactions (reporting why) and propose the rest.
     pub fn propose(&self, candidates: Vec<Transaction>) -> (Block, Vec<(Transaction, Reject)>) {
+        self.propose_at(0, candidates)
+    }
+
+    /// Propose for a given round (the proposer must be that round's leader).
+    pub fn propose_at(
+        &self,
+        round: u32,
+        candidates: Vec<Transaction>,
+    ) -> (Block, Vec<(Transaction, Reject)>) {
         let height = self.next_height();
         let mut s = self.state.clone();
         let (mut txs, mut rejected) = (vec![], vec![]);
@@ -86,7 +99,7 @@ impl Node {
         let header = BlockHeader {
             chain_id: self.genesis.chain_id(),
             height,
-            round: 0,
+            round,
             prev: self.tip(),
             tx_root: Block::tx_root(&txs),
             tx_count: txs.len() as u32,
@@ -107,6 +120,12 @@ impl Node {
 
     /// Follower: independently re-execute the proposal; vote only if every check passes.
     pub fn validate_and_vote(&self, block: &Block) -> Result<Vote, String> {
+        self.validate_block(block)?;
+        Ok(Vote::sign(&self.key, &block.header))
+    }
+
+    /// Every check a validator makes before voting for a proposed block.
+    pub fn validate_block(&self, block: &Block) -> Result<(), String> {
         let h = &block.header;
         if h.chain_id != self.genesis.chain_id()
             || h.height != self.next_height()
@@ -122,7 +141,7 @@ impl Node {
                 "state root mismatch: proposer's claimed result differs from re-execution".into(),
             );
         }
-        Ok(Vote::sign(&self.key, h))
+        Ok(())
     }
 
     /// Every check `commit` performs, without changing anything.

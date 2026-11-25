@@ -8,9 +8,10 @@
 //! than f validators sign both, which is itself provable misbehaviour
 //! ([`EquivocationEvidence`]).
 //!
-//! This module is the safety core (proposal, voting, certificates,
-//! equivocation evidence). Networking, view change and liveness timers are
-//! out of scope for the prototype; see docs/ARCHITECTURE.md.
+//! This module holds the safety core: blocks, two-phase votes (prevote and
+//! precommit), certificates and equivocation evidence. The round-based
+//! protocol that drives them, with locking, timeouts and view change, is in
+//! [`crate::bft`].
 
 use crate::codec::{Canonical, Enc};
 use crate::crypto::{
@@ -82,36 +83,81 @@ impl BlockHeader {
     }
 }
 
+/// The two voting phases. The phase is inside the signed bytes, so a prevote
+/// can never be replayed as a precommit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum VoteKind {
+    Prevote,
+    Precommit,
+}
+
+impl VoteKind {
+    fn tag(self) -> u8 {
+        match self {
+            VoteKind::Prevote => 1,
+            VoteKind::Precommit => 2,
+        }
+    }
+}
+
+/// The "nil" vote target: no block in this round. All-zero cannot collide
+/// with a SHA3-256 block hash in practice.
+pub const NIL: Hash = [0u8; 32];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Vote {
     pub chain_id: Hash,
     pub height: u64,
     pub round: u32,
+    pub kind: VoteKind,
     pub block: Hash,
     pub validator: KeyId,
     pub signature: HybridSignature,
 }
 
-fn vote_message(chain_id: &Hash, height: u64, round: u32, block: &Hash) -> Vec<u8> {
+fn vote_message(chain_id: &Hash, height: u64, round: u32, kind: VoteKind, block: &Hash) -> Vec<u8> {
     let mut e = Enc::new();
-    e.hash(chain_id).u64(height).u32(round).hash(block);
+    e.hash(chain_id)
+        .u64(height)
+        .u32(round)
+        .u8(kind.tag())
+        .hash(block);
     e.finish()
 }
 
 impl Vote {
-    pub fn sign(key: &HybridKeypair, h: &BlockHeader) -> Self {
-        let block = h.hash();
+    pub fn new(
+        key: &HybridKeypair,
+        chain_id: Hash,
+        height: u64,
+        round: u32,
+        kind: VoteKind,
+        block: Hash,
+    ) -> Self {
         Vote {
-            chain_id: h.chain_id,
-            height: h.height,
-            round: h.round,
+            chain_id,
+            height,
+            round,
+            kind,
             block,
             validator: key.id(),
             signature: key.sign(
                 VOTE_DOMAIN,
-                &vote_message(&h.chain_id, h.height, h.round, &block),
+                &vote_message(&chain_id, height, round, kind, &block),
             ),
         }
+    }
+
+    /// A precommit for this header in the header's own round.
+    pub fn sign(key: &HybridKeypair, h: &BlockHeader) -> Self {
+        Self::new(
+            key,
+            h.chain_id,
+            h.height,
+            h.round,
+            VoteKind::Precommit,
+            h.hash(),
+        )
     }
 
     pub fn verify(&self, vs: &ValidatorSet) -> bool {
@@ -119,7 +165,13 @@ impl Vote {
             Some(pk) => verify(
                 pk,
                 VOTE_DOMAIN,
-                &vote_message(&self.chain_id, self.height, self.round, &self.block),
+                &vote_message(
+                    &self.chain_id,
+                    self.height,
+                    self.round,
+                    self.kind,
+                    &self.block,
+                ),
                 &self.signature,
             )
             .is_ok(),
@@ -134,14 +186,25 @@ pub struct QuorumCertificate {
 }
 
 impl QuorumCertificate {
-    /// Valid iff at least n−f distinct validators signed exactly this header.
+    /// Valid iff at least n−f distinct validators precommitted exactly this
+    /// header, all in the same round. The round may be later than the one the
+    /// block was first proposed in, when a locked block is re-proposed.
     pub fn verify(&self, h: &BlockHeader, vs: &ValidatorSet) -> Result<(), String> {
         let want = h.hash();
+        let round = self
+            .votes
+            .first()
+            .map(|v| v.round)
+            .ok_or("empty certificate")?;
+        if round < h.round {
+            return Err("certificate round precedes the block's proposal round".into());
+        }
         let mut signers = BTreeSet::new();
         for v in &self.votes {
             if v.chain_id != h.chain_id
                 || v.height != h.height
-                || v.round != h.round
+                || v.round != round
+                || v.kind != VoteKind::Precommit
                 || v.block != want
             {
                 return Err(format!(
@@ -230,6 +293,7 @@ impl EquivocationEvidence {
             && a.chain_id == b.chain_id
             && a.height == b.height
             && a.round == b.round
+            && a.kind == b.kind
             && a.block != b.block;
         (conflicting && a.verify(vs) && b.verify(vs)).then(|| Self {
             a: a.clone(),
@@ -245,6 +309,7 @@ impl Canonical for Vote {
         e.hash(&self.chain_id)
             .u64(self.height)
             .u32(self.round)
+            .u8(self.kind.tag())
             .hash(&self.block)
             .hash(&self.validator);
         self.signature.encode(e);
@@ -298,6 +363,11 @@ impl Decode for Vote {
             chain_id: d.hash()?,
             height: d.u64()?,
             round: d.u32()?,
+            kind: match d.u8()? {
+                1 => VoteKind::Prevote,
+                2 => VoteKind::Precommit,
+                t => return derr(format!("unknown vote kind {t}")),
+            },
             block: d.hash()?,
             validator: d.hash()?,
             signature: HybridSignature::decode(d)?,

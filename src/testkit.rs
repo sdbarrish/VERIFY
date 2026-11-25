@@ -3,6 +3,7 @@
 //! Keys are derived from public seeds so runs are reproducible. That is for
 //! simulation only; real keys come from a documented ceremony in an HSM (§6.2).
 
+use crate::bft::{SimConfig, SimNet};
 use crate::consensus::Vote;
 use crate::crypto::{hash, CommitmentOpening, Hash, HybridKeypair, KeyId};
 use crate::node::{certify, Node};
@@ -221,6 +222,14 @@ pub const VALIDATORS: [&str; 4] = [
     "validator-miami",
     "validator-independent",
 ];
+/// Name of validator `i`: the four named reference validators, then extras.
+pub fn validator_name(i: usize) -> String {
+    VALIDATORS
+        .get(i)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("validator-extra-{i}"))
+}
+
 pub const ROOTS: [&str; 3] = ["root-county", "root-state", "root-independent"];
 
 /// Everything a submitted block produced.
@@ -231,16 +240,19 @@ pub struct Round {
 
 impl Network {
     pub fn new() -> Self {
+        Self::with_validators(VALIDATORS.len())
+    }
+
+    /// A network of `n` validators (n >= 4); the first four use the named keys.
+    pub fn with_validators(n: usize) -> Self {
+        let names: Vec<String> = (0..n).map(validator_name).collect();
         let genesis = Genesis {
             network: "VERIFY-SIM".into(),
-            validators: VALIDATORS
-                .iter()
-                .map(|v| demo_key(v).public().clone())
-                .collect(),
+            validators: names.iter().map(|v| demo_key(v).public().clone()).collect(),
             root_authorities: ROOTS.iter().map(|r| demo_key(r).public().clone()).collect(),
             root_threshold: 2,
         };
-        let nodes = VALIDATORS
+        let nodes = names
             .iter()
             .map(|v| Node::new(v, demo_key(v), genesis.clone()))
             .collect();
@@ -249,6 +261,45 @@ impl Network {
             nodes,
             nonces: BTreeMap::new(),
         }
+    }
+
+    /// Hand the validators to a simulated asynchronous network. Build any
+    /// transactions first: they are bound to the chain, not to the harness.
+    pub fn into_sim(self, cfg: SimConfig) -> SimNet {
+        SimNet::new(self.nodes, cfg)
+    }
+
+    /// Policy activation and commencement, in order, ready for one block.
+    pub fn bootstrap_txs(&mut self) -> Vec<Transaction> {
+        vec![
+            self.tx(
+                &["root-county", "root-state"],
+                Payload::ActivatePolicy(reference_policy()),
+                None,
+            ),
+            self.tx(
+                &["root-county", "root-independent"],
+                Payload::CommenceElection,
+                None,
+            ),
+        ]
+    }
+
+    pub fn register_tx(&mut self, batch: &str, quantity: u64) -> Transaction {
+        let inventory =
+            CommitmentOpening::new(format!("{batch}:serials 000001-{quantity:06}").as_bytes());
+        let seal = CommitmentOpening::new(format!("{batch}:seal").as_bytes());
+        self.tx(
+            &["warehouse-1", "warehouse-2"],
+            Payload::RegisterBatch {
+                batch_id: batch.into(),
+                ballot_style: "BS-07".into(),
+                quantity,
+                inventory_commitment: inventory.commitment(),
+                seal_commitment: seal.commitment(),
+            },
+            None,
+        )
     }
 
     pub fn height(&self) -> u64 {

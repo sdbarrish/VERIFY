@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+pub mod bft;
 pub mod codec;
 pub mod consensus;
 pub mod crypto;

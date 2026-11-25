@@ -8,7 +8,7 @@ This document maps the prototype to the VERIFY Master White Paper (Rev 1.0, 25 N
  ┌───────────────────────────────────────────────────────────────┐
  │ Independent auditor (node::audit)  — no keys, replays from genesis
  ├───────────────────────────────────────────────────────────────┤
- │ Consensus (consensus.rs, node.rs)                             │
+ │ Consensus (bft.rs, consensus.rs, node.rs)                     │
  │   leader schedule · proposal sig · re-execution · votes · QC  │
  ├───────────────────────────────────────────────────────────────┤
  │ CORE state machine (state.rs)                                 │
@@ -67,11 +67,55 @@ The payload is one of: `ActivatePolicy`, `CommenceElection`, `RegisterBatch`, `C
 - n = 3f+1 validators, quorum = n−f. The leader is chosen round-robin by `(height + round) mod n`.
 - The leader proposes a header containing `prev`, `tx_root`, `tx_count`, `state_root` and `proposer`, and signs it.
 - Each validator checks the link, the leader schedule, the proposer signature and the Merkle root. It then **re-executes every transaction** and votes only if its own state root matches.
-- A quorum certificate holds n−f distinct, valid, hybrid-signed votes for exactly that header. Nodes commit only with a valid quorum certificate.
-- `EquivocationEvidence` is two valid votes from one validator for different blocks at the same height and round.
-- **Safety argument:** any two quorums of size n−f intersect in at least n−2f ≥ f+1 validators, so at least one honest validator is in both, and that validator never signs two blocks at one height.
+- Votes come in two kinds, **prevote** and **precommit**. The kind is inside the signed bytes, and a vote may target a block or **nil**.
+- A quorum certificate holds n−f distinct, valid precommits for exactly that header, all from one round. Nodes commit only with a valid quorum certificate.
+- `EquivocationEvidence` is two valid votes of the same kind from one validator for different targets at the same height and round.
 
-**Not yet implemented:** peer-to-peer networking, view change and timeouts (liveness under a faulty leader), validator set reconfiguration, and slashing or removal flows. A production design would adopt a published protocol such as HotStuff-2 or Tendermint for these and keep the existing safety core and hybrid signatures.
+### Round-based protocol (`bft.rs`)
+
+The protocol follows the published Tendermint algorithm (Buchman, Kwon and Milosevic, 2018). At each height, round r runs as follows:
+
+1. **Propose.** The leader of (height, r) signs a proposal. If it holds a block that already gathered n−f prevotes (a "polka"), it re-proposes that block and names the round of the polka.
+2. **Prevote.** A validator prevotes the proposal only if it re-executes validly and is compatible with the validator's lock: it is not locked, it is locked on this same block, or the proposal carries a polka newer than the lock. Otherwise it prevotes nil, or it prevotes nil when the propose timeout expires.
+3. **Precommit.** On n−f prevotes for the proposal, the validator **locks** on the block and precommits it. On n−f nil prevotes, or when the prevote timeout expires, it precommits nil.
+4. **Commit or next round.** n−f precommits for a block in any round commit it. Otherwise the precommit timeout starts round r+1 with the next leader. Timeouts grow by a fixed step each round. Seeing f+1 validators in a later round makes a validator jump ahead, because at least one of them is honest.
+
+**Safety argument:** any two quorums of size n−f intersect in at least n−2f ≥ f+1 validators, so at least one honest validator is in both.
+- Within a round, that honest validator does not precommit two blocks.
+- Across rounds, the lock stops it prevoting a conflicting block unless a newer polka exists, and a newer polka also needs that overlap.
+
+This holds under any message timing.
+
+**Liveness:** once message delays fall below the growing timeouts, some round has an honest leader, and every honest validator commits.
+
+**Catch-up and recovery:**
+- A validator's consensus state is durable. After a restart it resumes its round and step, never an earlier step, so it cannot vote twice.
+- It asks peers for committed blocks and re-verifies every certificate itself.
+- Peers also re-send their signed proposals and votes for the current height. Relaying is safe because everything is signed.
+
+### Simulated network and tests
+
+`SimNet` is a deterministic, seeded, in-process network. It models random delays, validator outages with or without recovery, partitions (messages held until the split heals) and equivocating Byzantine validators. `tests/liveness.rs` covers:
+
+- honest runs across seeds, with the independent audit;
+- view change after a crashed leader;
+- f+1 validators down (no commits), then recovery;
+- catch-up of a recovered validator;
+- a 2|2 partition (no commits), then heal;
+- an equivocating leader and voter (agreement holds, evidence collected, no honest validator accused);
+- 7 validators with 2 Byzantine;
+- delays far beyond the timeouts, where safety holds without liveness;
+- a message-by-message test of the lock rule.
+
+Two quality checks were run outside the committed suite:
+- A 200-run seed sweep found 0 forks.
+- Disabling the lock rule was caught by the lock-rule test. The randomized tests alone did not catch it, which is why that test exists.
+
+**Not yet implemented:**
+- real authenticated network transport. The replica logic is transport-independent; validator transport would reuse the hybrid KEM;
+- validator set reconfiguration;
+- removal or slashing based on equivocation evidence;
+- rate limiting of gossip.
 
 ## 6. Export and independent audit
 
@@ -108,7 +152,7 @@ Done:
 
 Next:
 1. Swap the demo seeds for HSM-backed keys and a documented key ceremony. SLH-DSA (FIPS 205) is the candidate for long-lived root keys.
-2. Networking with view change, using a published BFT protocol. Validator transport would reuse the hybrid KEM.
+2. Real authenticated transport for the BFT protocol (done in simulation), using the hybrid KEM for validator links. Then deployment tests across separate sites.
 3. Persistent storage, checkpoints, and independent witness checkpoints held by separate operators.
 4. A sanitized, one-way export path for certified historical data feeding the isolated AI gateway (§8.4), with no reverse API.
 5. Coverage-guided fuzzing (cargo-fuzz) of the codec and state machine, reproducible builds and signed releases (§6.4).
