@@ -1,0 +1,21 @@
+[package]
+name = "verify-chain"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "VERIFY ledger prototype: permissioned BFT chain with hybrid post-quantum signatures, custody policy enforcement and protocol-level AI isolation"
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+ed25519-dalek = { version = "3.0.0", features = ["zeroize"] }
+fips204 = { version = "0.5.0", default-features = false, features = ["default-rng", "ml-dsa-65"] }
+sha3 = "0.10"
+getrandom = "0.2"
+
+[profile.release]
+overflow-checks = true
+
+[[bin]]
+name = "verify-sim"
+path = "src/bin/verify-sim.rs"
