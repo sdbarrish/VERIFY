@@ -12,6 +12,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int, default=3334)
 ap.add_argument("--shares", type=int, default=2)
 ap.add_argument("--timeout", type=int, default=300)
+ap.add_argument("--expect-user", help="fail unless the miner authorizes as this username")
 a = ap.parse_args()
 
 EN1 = bytes.fromhex("f00dbabe"); EN2_SIZE = 4
@@ -45,12 +46,15 @@ while time.time() < t_end:
     if m["method"] == "mining.subscribe":
         send({"id": m["id"], "result": [[["mining.notify", "x"]], EN1.hex(), EN2_SIZE], "error": None})
     elif m["method"] == "mining.authorize":
+        print(f"authorize as {m['params'][0]}", flush=True)
+        if a.expect_user and m["params"][0] != a.expect_user: print("WRONG USER"); sys.exit(1)
         send({"id": m["id"], "result": True, "error": None})
         send({"id": None, "method": "mining.set_difficulty", "params": [1]})
         send({"id": None, "method": "mining.notify",
               "params": [JOB, prevhash, coinb1, coinb2, branches, version, nbits, ntime, True]})
     elif m["method"] == "mining.submit":
         user, job, en2, nt, nonce = m["params"]
+        if a.expect_user and user != a.expect_user: print("WRONG USER on submit"); sys.exit(1)
         h = dsha(header(en2, nt, nonce))
         val = int.from_bytes(h, "little")
         ok = job == JOB and val <= DIFF1 and (en2, nonce) not in seen

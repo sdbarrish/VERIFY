@@ -8,22 +8,43 @@ It has two hand-optimized hash kernels for the two SHA-256 engines a 7900X has.
 > cannot mine Bitcoin profitably. This project is for learning, testing and
 > lottery-style solo mining only.
 
-## Build and run
+## Payout address
+
+Block rewards are hard-coded to **`bc1qjuw4hk4p68dx3fue3gerdmvqsvwtwxgvsjwkjx`**
+(`PAYOUT_ADDRESS` in `src/miner.c`, checked as valid mainnet bech32 P2WPKH). It is always sent as
+the Stratum username, as `ADDRESS.WORKER`. The default pool is **solo.ckpool.org**, which
+pays a found block directly to that address. On a regular (non-solo) pool, the username
+is a pool account name, not an address, so `-o` should point at a solo pool.
+
+## Windows
+
+`dist/zenminer.exe` is a ready-made, standalone 64-bit Windows build. It needs no DLLs
+beyond the ones Windows ships with. Open **Command Prompt** in its folder and run:
+
+```bat
+zenminer.exe --test        :: self-test (should end with "all tests passed")
+zenminer.exe --bench       :: hashrate, no network
+zenminer.exe               :: start mining to the built-in address on solo.ckpool.org
+zenminer.exe -w gamingpc   :: same, with a worker name
+```
+
+Press Ctrl+C to stop. Windows Defender or SmartScreen may flag an unsigned miner. That
+is expected for any mining software. Verify the file with `certutil -hashfile zenminer.exe SHA256`
+against `dist/zenminer.exe.sha256`. To rebuild: `make windows` (needs `gcc-mingw-w64-x86-64-posix`).
+
+## Build and run (Linux)
 
 ```bash
 make                      # gcc, -march=znver4 (Ryzen 7000/9000). Use `make MARCH=native` elsewhere
 ./zenminer --test         # self-test every kernel against reference SHA-256 (incl. genesis block)
 ./zenminer --bench        # auto-picks the fastest kernel, then benchmarks 20 s
 
-# pool or solo pool (your BTC address is the username on solo pools)
-./zenminer -o stratum+tcp://solo.ckpool.org:3333 -u bc1qYOURADDRESS.7900x -p x
-./zenminer -o stratum+tcp://public-pool.io:21496 -u bc1qYOURADDRESS.7900x --suggest-diff 1
+./zenminer                # mine to the built-in address on solo.ckpool.org
+./zenminer -o stratum+tcp://public-pool.io:21496 -w 7900x --suggest-diff 1   # another solo pool
 ```
 
-Options: `-t N` threads (default: all 24), `-a auto|shani|avx512|mixed|scalar`,
-`--no-affinity`, `--secs S` (bench length). Linux only (pthreads, BSD sockets).
-On Windows, build and run it under **WSL2**. The hashing is pure CPU, so it runs at
-native speed there.
+Options: `-o URL` pool, `-w NAME` worker name, `-t N` threads (default: all 24),
+`-a auto|shani|avx512|mixed|scalar`, `--no-affinity`, `--secs S` (bench length).
 
 ## How it is optimized for Zen 4
 
@@ -66,7 +87,8 @@ temperatures: this is a 100% all-core load.
   nonce's exact digest word at 32 different lane positions (including a window that wraps at 2³²).
 - `tests/mock_pool.py`: a Stratum pool that rebuilds each submitted header independently
   (Python `hashlib`) and checks the share. Run:
-  `python3 tests/mock_pool.py --shares 3 & ./zenminer -o stratum+tcp://127.0.0.1:3334 -u test`
+  `python3 tests/mock_pool.py --shares 3 --expect-user bc1qjuw4hk4p68dx3fue3gerdmvqsvwtwxgvsjwkjx.zenminer & ./zenminer -o stratum+tcp://127.0.0.1:3334`
+  The Windows `.exe` passes the same tests under Wine at the same hashrate as the Linux build.
 
 Not implemented: version rolling (BIP 310 / ASICBoost), `getblocktemplate` solo mining
 directly against bitcoind, TLS stratum, and share difficulty below 1 (the kernels only

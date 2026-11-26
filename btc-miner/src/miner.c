@@ -1,8 +1,13 @@
 /* zenminer: Bitcoin SHA-256d CPU miner tuned for AMD Zen 4 (Ryzen 9 7900X).
  *
+ *   zenminer                                mine to the built-in payout address on the default solo pool
  *   zenminer --test                         self-test every scanner against reference SHA-256
  *   zenminer --bench [-t N] [-a ALGO]       measure hashrate (no network)
- *   zenminer -o stratum+tcp://host:port -u USER [-p PASS] [-t N] [-a ALGO]
+ *   zenminer [-o stratum+tcp://host:port] [-w WORKER] [-t N] [-a ALGO]
+ *
+ * The payout address is fixed at compile time (PAYOUT_ADDRESS) and is always sent as
+ * the Stratum username. Solo pools such as solo.ckpool.org pay block rewards to the
+ * address given as the username. Builds for Linux and for Windows (MinGW-w64).
  *
  * ALGO: auto | shani | avx512 | mixed | scalar
  *   mixed = SHA-NI on the first half of the threads, AVX-512 on the second half.
@@ -15,21 +20,66 @@
 #include "sha256.h"
 
 #include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+typedef SOCKET sock_t;
+#define BAD_SOCK INVALID_SOCKET
+#define sock_close closesocket
+#define poll WSAPoll
+#define MSG_NOSIGNAL 0
+static void sleep_ms(unsigned ms) { Sleep(ms); }
+static double now_s(void) {
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart / (double)f.QuadPart;
+}
+static void local_time(time_t t, struct tm *tm) { localtime_s(tm, &t); }
+static int ncpu(void) { DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS); return n ? (int)n : 1; }
+static void pin_thread(int cpu) { if (cpu < 64) SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << cpu); }
+#else
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
-#include <pthread.h>
 #include <sched.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdatomic.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/socket.h>
-#include <time.h>
 #include <unistd.h>
+typedef int sock_t;
+#define BAD_SOCK (-1)
+#define sock_close close
+static void sleep_ms(unsigned ms) { usleep(ms * 1000u); }
+static double now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+static void local_time(time_t t, struct tm *tm) { localtime_r(&t, tm); }
+static int ncpu(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (int)n : 1; }
+static void pin_thread(int cpu) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu % CPU_SETSIZE, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+}
+#endif
+
+/* Block rewards go here. Sent as the Stratum username on every connection. */
+#define PAYOUT_ADDRESS "bc1qjuw4hk4p68dx3fue3gerdmvqsvwtwxgvsjwkjx"
+#define DEFAULT_POOL "stratum+tcp://solo.ckpool.org:3333"
 
 #define MAX_THREADS 256
 #define CHUNK (1u << 16) /* nonces per scan call; also the new-job check interval */
@@ -38,18 +88,12 @@
 
 /* ------------------------------------------------------------------ utils */
 
-static double now_s(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec * 1e-9;
-}
-
 static pthread_mutex_t log_mtx = PTHREAD_MUTEX_INITIALIZER;
 static void logf_(const char *fmt, ...) {
     va_list ap;
     time_t t = time(NULL);
     struct tm tm;
-    localtime_r(&t, &tm);
+    local_time(t, &tm);
     pthread_mutex_lock(&log_mtx);
     printf("[%02d:%02d:%02d] ", tm.tm_hour, tm.tm_min, tm.tm_sec);
     va_start(ap, fmt);
@@ -132,7 +176,8 @@ typedef struct {
 } job_t;
 
 static struct {
-    const char *host, *port, *user, *pass;
+    const char *host, *port, *pass;
+    char user[256]; /* PAYOUT_ADDRESS[.worker] */
     int threads;
     const char *algo;
     double suggest_diff;
@@ -154,16 +199,16 @@ static scan_fn g_scan[MAX_THREADS];
 static atomic_ullong g_accepted, g_rejected, g_submitted, g_hw_err, g_blocks;
 static double g_best_diff;
 
-static int g_sock = -1;
+static sock_t g_sock = BAD_SOCK;
 static pthread_mutex_t send_mtx = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int g_next_id = 100;
 
 static int send_line(const char *s) {
     pthread_mutex_lock(&send_mtx);
-    int ok = g_sock >= 0;
+    int ok = g_sock != BAD_SOCK;
     size_t n = strlen(s), off = 0;
     while (ok && off < n) {
-        ssize_t w = send(g_sock, s + off, n - off, MSG_NOSIGNAL);
+        int w = (int)send(g_sock, s + off, (int)(n - off), MSG_NOSIGNAL);
         if (w <= 0) { if (errno == EINTR) continue; ok = 0; break; }
         off += (size_t)w;
     }
@@ -206,12 +251,7 @@ static void submit(const job_t *j, const char *en2_hex, uint32_t nonce) {
 
 static void *worker(void *arg) {
     int tid = (int)(intptr_t)arg;
-    if (!opt.no_affinity) {
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        CPU_SET(tid % CPU_SETSIZE, &set);
-        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
-    }
+    if (!opt.no_affinity) pin_thread(tid);
     job_t *job = malloc(sizeof *job);
     uint8_t *cb = malloc(MAX_CB);
     if (!job || !cb) { logf_("worker %d: out of memory", tid); return NULL; }
@@ -220,7 +260,7 @@ static void *worker(void *arg) {
     scan_fn scan = g_scan[tid];
 
     while (!atomic_load(&g_quit)) {
-        if (!atomic_load(&g_have_job)) { usleep(50000); continue; }
+        if (!atomic_load(&g_have_job)) { sleep_ms(50); continue; }
         if (atomic_load(&g_job_gen) != my_gen) {
             pthread_mutex_lock(&job_mtx);
             memcpy(job, &g_job, sizeof *job);
@@ -274,8 +314,6 @@ static void *worker(void *arg) {
 
 /* ------------------------------------------------------------------ algorithms */
 
-static int ncpu(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (int)n : 1; }
-
 static int assign_algo(const char *a, int threads) {
     int sha = cpu_has_shani(), avx = cpu_has_avx512();
     for (int t = 0; t < threads; t++) {
@@ -313,13 +351,13 @@ static double run_bench(int threads, double secs, int verbose) {
     atomic_fetch_add(&g_job_gen, 1);
     atomic_store(&g_have_job, 1);
     for (int t = 0; t < threads; t++) pthread_create(&th[t], NULL, worker, (void *)(intptr_t)t);
-    usleep(300000); /* let clocks ramp and caches warm */
+    sleep_ms(300); /* let clocks ramp and caches warm */
     unsigned long long h0 = 0;
     for (int t = 0; t < threads; t++) h0 += atomic_load(&g_hashes[t].hashes);
     double t0 = now_s(), last = t0;
     unsigned long long hl = h0;
     while (now_s() - t0 < secs) {
-        usleep(100000);
+        sleep_ms(100);
         if (verbose && now_s() - last >= 5) {
             unsigned long long h = 0;
             for (int t = 0; t < threads; t++) h += atomic_load(&g_hashes[t].hashes);
@@ -344,6 +382,7 @@ static const char *pick_algo(int threads) {
     logf_("auto: benchmarking scanners on %d threads (2 s each)...", threads);
     for (size_t i = 0; i < sizeof cands / sizeof *cands; i++) {
         if (!assign_algo(cands[i], threads)) continue;
+        if (!strcmp(cands[i], "mixed") && threads < 2) continue;
         double r = run_bench(threads, 2.0, 0);
         logf_("auto:   %-7s %8.2f MH/s", cands[i], r / 1e6);
         if (r > best_rate) { best_rate = r; best = cands[i]; }
@@ -539,23 +578,23 @@ static void handle_line(const char *line) {
     json_free(m);
 }
 
-static int stratum_connect(void) {
+static sock_t stratum_connect(void) {
     struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM}, *res, *r;
     int e = getaddrinfo(opt.host, opt.port, &hints, &res);
-    if (e) { logf_("resolve %s: %s", opt.host, gai_strerror(e)); return -1; }
-    int fd = -1;
+    if (e) { logf_("resolve %s failed (error %d)", opt.host, e); return BAD_SOCK; }
+    sock_t fd = BAD_SOCK;
     for (r = res; r; r = r->ai_next) {
         fd = socket(r->ai_family, r->ai_socktype, r->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, r->ai_addr, r->ai_addrlen) == 0) break;
-        close(fd);
-        fd = -1;
+        if (fd == BAD_SOCK) continue;
+        if (connect(fd, r->ai_addr, (int)r->ai_addrlen) == 0) break;
+        sock_close(fd);
+        fd = BAD_SOCK;
     }
     freeaddrinfo(res);
-    if (fd < 0) { logf_("connect %s:%s failed", opt.host, opt.port); return -1; }
+    if (fd == BAD_SOCK) { logf_("connect %s:%s failed", opt.host, opt.port); return BAD_SOCK; }
     int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (const char *)&one, sizeof one);
     return fd;
 }
 
@@ -582,12 +621,12 @@ static int mine(int threads) {
     static char buf[1 << 16];
 
     while (!atomic_load(&g_quit)) {
-        int fd = stratum_connect();
-        if (fd < 0) { sleep(5); continue; }
+        sock_t fd = stratum_connect();
+        if (fd == BAD_SOCK) { sleep_ms(5000); continue; }
         pthread_mutex_lock(&send_mtx);
         g_sock = fd;
         pthread_mutex_unlock(&send_mtx);
-        logf_("connected to %s:%s", opt.host, opt.port);
+        logf_("connected to %s:%s, mining for %s", opt.host, opt.port, opt.user);
         char line[1024];
         send_line("{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"zenminer/1.0\"]}\n");
         snprintf(line, sizeof line, "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"%s\"]}\n", opt.user, opt.pass);
@@ -607,7 +646,7 @@ static int mine(int threads) {
                 if (now_s() - last_rx > 300) { logf_("no data from pool for 5 min, reconnecting"); break; }
                 continue;
             }
-            ssize_t r = recv(fd, buf + len, sizeof buf - 1 - len, 0);
+            int r = (int)recv(fd, buf + len, (int)(sizeof buf - 1 - len), 0);
             if (r <= 0) { logf_("connection closed"); break; }
             last_rx = now_s();
             len += (size_t)r;
@@ -624,10 +663,10 @@ static int mine(int threads) {
         }
         atomic_store(&g_have_job, 0); /* stop hashing stale work while disconnected */
         pthread_mutex_lock(&send_mtx);
-        g_sock = -1;
+        g_sock = BAD_SOCK;
         pthread_mutex_unlock(&send_mtx);
-        close(fd);
-        if (!atomic_load(&g_quit)) sleep(5);
+        sock_close(fd);
+        if (!atomic_load(&g_quit)) sleep_ms(5000);
     }
     for (int t = 0; t < threads; t++) pthread_join(th[t], NULL);
     return 0;
@@ -637,9 +676,14 @@ static int mine(int threads) {
 
 static void usage(void) {
     puts("zenminer - SHA-256d Bitcoin CPU miner tuned for AMD Zen 4 (Ryzen 7900X)\n\n"
-         "  zenminer --test\n"
-         "  zenminer --bench [-t N] [-a ALGO] [--secs S]\n"
-         "  zenminer -o stratum+tcp://HOST:PORT -u USER [-p PASS] [-t N] [-a ALGO] [--suggest-diff D]\n\n"
+         "  zenminer                        mine (defaults below)\n"
+         "  zenminer --test                 self-test\n"
+         "  zenminer --bench [--secs S]     benchmark, no network\n\n"
+         "  payout address  " PAYOUT_ADDRESS " (built in)\n"
+         "  -o URL          pool (default " DEFAULT_POOL ")\n"
+         "  -w WORKER       worker name appended to the address (default zenminer)\n"
+         "  -p PASS         pool password (default x)\n"
+         "  --suggest-diff D  ask the pool for share difficulty D\n"
          "  -t N            threads (default: all logical CPUs)\n"
          "  -a ALGO         auto | shani | avx512 | mixed | scalar   (default auto)\n"
          "  --no-affinity   do not pin thread i to logical CPU i");
@@ -648,23 +692,28 @@ static void usage(void) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     int test = 0, bench = 0;
-    const char *url = NULL;
+    const char *url = DEFAULT_POOL, *worker = "zenminer";
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
 #define NEXT (i + 1 < argc ? argv[++i] : (usage(), exit(2), ""))
         if (!strcmp(a, "--test")) test = 1;
         else if (!strcmp(a, "--bench")) bench = 1;
         else if (!strcmp(a, "-o")) url = NEXT;
-        else if (!strcmp(a, "-u")) opt.user = NEXT;
+        else if (!strcmp(a, "-w")) worker = NEXT;
         else if (!strcmp(a, "-p")) opt.pass = NEXT;
         else if (!strcmp(a, "-t")) opt.threads = atoi(NEXT);
         else if (!strcmp(a, "-a")) opt.algo = NEXT;
         else if (!strcmp(a, "--secs")) opt.bench_secs = atoi(NEXT);
         else if (!strcmp(a, "--suggest-diff")) opt.suggest_diff = atof(NEXT);
         else if (!strcmp(a, "--no-affinity")) opt.no_affinity = 1;
+        else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else { usage(); return 2; }
     }
     if (test) return selftest();
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa)) { fprintf(stderr, "WSAStartup failed\n"); return 1; }
+#endif
 
     int threads = opt.threads > 0 ? opt.threads : ncpu();
     if (threads > MAX_THREADS) threads = MAX_THREADS;
@@ -681,13 +730,19 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if (!url || !opt.user) { usage(); return 2; }
+    for (const char *c = worker; *c; c++)
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '_' || *c == '-')) {
+            fprintf(stderr, "worker name may only contain letters, digits, '_' and '-'\n");
+            return 2;
+        }
+    snprintf(opt.user, sizeof opt.user, "%s%s%s", PAYOUT_ADDRESS, *worker ? "." : "", worker);
     const char *hp = strstr(url, "://") ? strstr(url, "://") + 3 : url;
     char *host = strdup(hp), *colon = strrchr(host, ':');
     if (!colon) { fprintf(stderr, "URL needs a port\n"); return 2; }
     *colon = 0;
     opt.host = host;
     opt.port = colon + 1;
-    if (strchr(opt.user, '"') || strchr(opt.pass, '"')) { fprintf(stderr, "user/pass may not contain quotes\n"); return 2; }
+    if (strchr(opt.pass, '"') || strchr(opt.pass, '\\')) { fprintf(stderr, "password may not contain quotes or backslashes\n"); return 2; }
+    logf_("payout address: %s", PAYOUT_ADDRESS);
     return mine(threads);
 }

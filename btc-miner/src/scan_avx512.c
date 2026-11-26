@@ -15,6 +15,7 @@
  *  - round 0 of hash #2 starts from the constant IV, so it collapses to two adds.
  *  - hash #2 stops after round index 60, computing only e: digest word 7 = IV7 + h(S64)
  *    and h(S64) = e(S61), so rounds 61-63 and their message words are never needed. */
+#pragma GCC target("avx512f,avx512bw,avx512vl")
 #include "scan.h"
 #include "sha256.h"
 #include <immintrin.h>

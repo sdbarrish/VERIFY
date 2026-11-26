@@ -10,6 +10,7 @@
  *  - hash #2 stops after rounds 60-61: digest word 7 = IV7 + e(round 61), and after
  *    that rnds2 e(61) is already sitting in the F slot of the ABEF register, so the
  *    final rnds2, the feed-forward and the output shuffles are skipped. */
+#pragma GCC target("sha,sse4.1")
 #include "scan.h"
 #include "sha256.h"
 #include <immintrin.h>
@@ -49,7 +50,6 @@ AI void rounds(__m128i S0[L], __m128i S1[L], __m128i M[L][4], const int start_j,
     }
 }
 
-__attribute__((target("sha,sse4.1")))
 int scan_shani(const scan_job_t *job, uint32_t first, uint32_t count, uint32_t *out, int max_out) {
     __m128i mabef, mcdgh, iabef, icdgh;
     to_abef(job->mid, &mabef, &mcdgh);
