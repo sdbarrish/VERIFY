@@ -30,5 +30,7 @@ pub mod merkle;
 pub mod node;
 pub mod policy;
 pub mod state;
+pub mod store;
 pub mod testkit;
+pub mod transport;
 pub mod tx;

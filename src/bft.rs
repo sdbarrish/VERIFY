@@ -41,7 +41,7 @@ const SYNC_ROUNDS: u32 = 4;
 
 /// A leader's proposal for one round. `pol_round` is set when the leader
 /// re-proposes a block that already gathered n−f prevotes in that round.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proposal {
     pub height: u64,
     pub round: u32,
@@ -131,6 +131,9 @@ pub enum Msg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Step {
+    /// Waiting out the pause between heights (declared first: it orders
+    /// before every voting step, so no voting rule fires while waiting).
+    Commit,
     Propose,
     Prevote,
     Precommit,
@@ -162,6 +165,9 @@ pub enum Behavior {
 pub struct Timeouts {
     pub base: u64,
     pub per_round: u64,
+    /// Pause after a commit before the next height starts. It sets the block
+    /// rate on a real network; 0 (the simulation default) starts at once.
+    pub commit: u64,
 }
 
 impl Default for Timeouts {
@@ -169,6 +175,7 @@ impl Default for Timeouts {
         Self {
             base: 300,
             per_round: 150,
+            commit: 0,
         }
     }
 }
@@ -283,6 +290,7 @@ impl Replica {
                     self.step = Step::Precommit;
                 }
                 Step::Precommit => self.start_round(round + 1),
+                Step::Commit if self.step == Step::Commit => self.start_round(0),
                 _ => {}
             }
             self.progress();
@@ -446,7 +454,11 @@ impl Replica {
     }
 
     fn timer(&mut self, step: Step) {
-        let delay = self.timeouts.base + self.timeouts.per_round * self.round as u64;
+        let delay = if step == Step::Commit {
+            self.timeouts.commit
+        } else {
+            self.timeouts.base + self.timeouts.per_round * self.round as u64
+        };
         self.out.push(Out::Timer {
             delay,
             height: self.height(),
@@ -623,7 +635,12 @@ impl Replica {
                 return;
             }
         }
-        self.start_round(0);
+        if self.timeouts.commit > 0 {
+            self.step = Step::Commit;
+            self.timer(Step::Commit);
+        } else {
+            self.start_round(0);
+        }
         let replay: Vec<(usize, Msg)> = std::mem::take(&mut self.future);
         for (from, m) in replay {
             self.handle(from, m);
@@ -918,5 +935,226 @@ impl SimNet {
 
     pub fn min_honest_height(&self) -> usize {
         self.honest().map(|r| r.node.chain.len()).min().unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wire encoding and durable state
+// ---------------------------------------------------------------------------
+
+use crate::codec::{derr, Canonical, Dec, Decode, DecodeError};
+
+impl Canonical for Proposal {
+    fn encode(&self, e: &mut Enc) {
+        e.u64(self.height).u32(self.round);
+        match self.pol_round {
+            None => e.u8(0),
+            Some(r) => e.u8(1).u32(r),
+        };
+        self.block.encode(e);
+        self.signature.encode(e);
+    }
+}
+
+impl Decode for Proposal {
+    fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
+        let height = d.u64()?;
+        let round = d.u32()?;
+        let pol_round = match d.u8()? {
+            0 => None,
+            1 => Some(d.u32()?),
+            t => return derr(format!("bad pol tag {t}")),
+        };
+        Ok(Self {
+            height,
+            round,
+            pol_round,
+            block: Block::decode(d)?,
+            signature: HybridSignature::decode(d)?,
+        })
+    }
+}
+
+impl Canonical for Msg {
+    fn encode(&self, e: &mut Enc) {
+        match self {
+            Msg::Proposal(p) => {
+                e.u8(1);
+                p.encode(e);
+            }
+            Msg::Vote(v) => {
+                e.u8(2);
+                v.encode(e);
+            }
+            Msg::Commit(b) => {
+                e.u8(3);
+                b.encode(e);
+            }
+            Msg::SyncRequest { from_height } => {
+                e.u8(4).u64(*from_height);
+            }
+        }
+    }
+}
+
+impl Decode for Msg {
+    fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
+        Ok(match d.u8()? {
+            1 => Msg::Proposal(Box::new(Proposal::decode(d)?)),
+            2 => Msg::Vote(Vote::decode(d)?),
+            3 => Msg::Commit(Box::new(Block::decode(d)?)),
+            4 => Msg::SyncRequest {
+                from_height: d.u64()?,
+            },
+            t => return derr(format!("unknown message tag {t}")),
+        })
+    }
+}
+
+impl Step {
+    fn tag(self) -> u8 {
+        match self {
+            Step::Commit => 0,
+            Step::Propose => 1,
+            Step::Prevote => 2,
+            Step::Precommit => 3,
+        }
+    }
+}
+
+/// The consensus state a validator must keep across a crash so that, after a
+/// restart, it never votes twice in a round or forgets a lock. Written to disk
+/// before any message produced by the same event is sent (write-ahead).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Durable {
+    pub height: u64,
+    pub round: u32,
+    pub step: Step,
+    pub locked: Option<(u32, Hash)>,
+    pub valid: Option<(u32, Hash)>,
+    /// Bodies of the locked and valid blocks, needed to re-propose them.
+    pub blocks: Vec<Block>,
+    /// This validator's own signed votes at this height.
+    pub own_votes: Vec<Vote>,
+    /// This validator's own signed proposals at this height.
+    pub own_proposals: Vec<Proposal>,
+}
+
+fn enc_lock(e: &mut Enc, l: &Option<(u32, Hash)>) {
+    match l {
+        None => {
+            e.u8(0);
+        }
+        Some((r, h)) => {
+            e.u8(1).u32(*r).hash(h);
+        }
+    }
+}
+
+fn dec_lock(d: &mut Dec<'_>) -> Result<Option<(u32, Hash)>, DecodeError> {
+    match d.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some((d.u32()?, d.hash()?))),
+        t => derr(format!("bad lock tag {t}")),
+    }
+}
+
+impl Canonical for Durable {
+    fn encode(&self, e: &mut Enc) {
+        e.str("VERIFY-DURABLE/v1")
+            .u64(self.height)
+            .u32(self.round)
+            .u8(self.step.tag());
+        enc_lock(e, &self.locked);
+        enc_lock(e, &self.valid);
+        e.list(&self.blocks)
+            .list(&self.own_votes)
+            .list(&self.own_proposals);
+    }
+}
+
+impl Decode for Durable {
+    fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
+        if d.str()? != "VERIFY-DURABLE/v1" {
+            return derr("not a durable-state record");
+        }
+        Ok(Self {
+            height: d.u64()?,
+            round: d.u32()?,
+            step: match d.u8()? {
+                0 => Step::Commit,
+                1 => Step::Propose,
+                2 => Step::Prevote,
+                3 => Step::Precommit,
+                t => return derr(format!("bad step {t}")),
+            },
+            locked: dec_lock(d)?,
+            valid: dec_lock(d)?,
+            blocks: d.list(4)?,
+            own_votes: d.list(1 << 16)?,
+            own_proposals: d.list(1 << 16)?,
+        })
+    }
+}
+
+impl Replica {
+    /// Snapshot of what must survive a crash.
+    pub fn durable(&self) -> Durable {
+        let me = self.node.id();
+        let mut blocks = vec![];
+        for (_, h) in self.locked.iter().chain(self.valid.iter()) {
+            if let Some(b) = self.blocks.get(h) {
+                if !blocks.iter().any(|x: &Block| x.header.hash() == *h) {
+                    blocks.push(b.clone());
+                }
+            }
+        }
+        let own_votes = self
+            .votes
+            .values()
+            .filter_map(|m| m.get(&me).cloned())
+            .collect();
+        let leader_rounds: Vec<Proposal> = self
+            .proposal_msgs
+            .values()
+            .filter(|p| self.node.validators.leader(p.height, p.round) == me)
+            .cloned()
+            .collect();
+        Durable {
+            height: self.height(),
+            round: self.round,
+            step: self.step,
+            locked: self.locked,
+            valid: self.valid,
+            blocks,
+            own_votes,
+            own_proposals: leader_rounds,
+        }
+    }
+
+    /// Reload state saved by [`Replica::durable`]. Ignored if it belongs to a
+    /// different height (the chain moved on, so nothing at the old height can
+    /// be voted on again). Call [`Replica::recover`] afterwards.
+    pub fn restore(&mut self, d: Durable) -> bool {
+        if d.height != self.height() {
+            return false;
+        }
+        self.round = d.round;
+        self.step = d.step;
+        self.locked = d.locked;
+        self.valid = d.valid;
+        for b in d.blocks {
+            self.blocks.insert(b.header.hash(), b);
+        }
+        for v in d.own_votes {
+            self.record_vote(v);
+        }
+        for p in d.own_proposals {
+            let bh = p.block.header.hash();
+            self.blocks.entry(bh).or_insert_with(|| p.block.clone());
+            self.proposals.entry(p.round).or_insert((bh, p.pol_round));
+            self.proposal_msgs.entry(p.round).or_insert(p);
+        }
+        true
     }
 }

@@ -26,3 +26,7 @@ path = "src/bin/verify-sim.rs"
 [[bin]]
 name = "verify-audit"
 path = "src/bin/verify-audit.rs"
+
+[[bin]]
+name = "verify-node"
+path = "src/bin/verify-node.rs"

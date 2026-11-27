@@ -111,11 +111,32 @@ Two quality checks were run outside the committed suite:
 - A 200-run seed sweep found 0 forks.
 - Disabling the lock rule was caught by the lock-rule test. The randomized tests alone did not catch it, which is why that test exists.
 
+### Validator processes, transport and storage
+
+`verify-node` runs the same replica logic as the simulation, as an OS process:
+
+- **Transport** (`transport.rs`). The dialler sends an ephemeral X25519 key and an ephemeral ML-KEM-768 encapsulation key. The responder encapsulates and signs the transcript with its hybrid validator key; the dialler checks it is the validator it meant to reach, then signs the full transcript.
+  - Session keys come from SHA3 over both shared secrets and the transcript, one key per direction.
+  - Frames are ChaCha20-Poly1305 with a 64-bit counter nonce, so a replayed, reordered or altered frame closes the channel.
+  - Only validators in the genesis set can complete a handshake. Both KEM keys are ephemeral, so the links are forward secret against classical and quantum attackers.
+- **Storage** (`store.rs`). Committed blocks are appended and synced. A torn final write is trimmed on start, and every stored block is re-verified (certificate, links, re-execution) before it is trusted.
+  - Consensus state ([`Durable`]: round, step, lock, valid block, own votes and proposals) is replaced atomically.
+- **Write-ahead rule.** After every event the node persists new blocks, then consensus state, and only then lets the event's messages out. A crash can lose messages, which peers recover by re-sync, but never a vote or a lock. A restarted validator resumes at its saved step, so it cannot vote twice.
+- **Re-sync.** Dialers reconnect forever. A node that has not advanced for 3 seconds asks peers for committed blocks and for current-height messages.
+- **Block rate.** A configurable pause between heights (`--block-interval-ms`, Tendermint's commit timeout) stops a fast network minting empty blocks continuously.
+
+`tests/network.rs` runs four `verify-node` processes on localhost.
+- It SIGKILLs one validator, checks the other three continue, restarts it from disk and checks it catches up.
+- It starts only two of four and checks nothing commits, then adds a third and checks progress.
+- After each run, every stored chain must agree, and the longest must pass the independent audit.
+
 **Not yet implemented:**
-- real authenticated network transport. The replica logic is transport-independent; validator transport would reuse the hybrid KEM;
+- deployment across separate sites and operators;
+- validator keys loaded from HSMs (the processes use demo keys);
+- a transaction submission API (the demo loads transactions from a file);
 - validator set reconfiguration;
 - removal or slashing based on equivocation evidence;
-- rate limiting of gossip.
+- rate limiting and denial-of-service protection for connections and gossip.
 
 ## 6. Export and independent audit
 
@@ -152,7 +173,7 @@ Done:
 
 Next:
 1. Swap the demo seeds for HSM-backed keys and a documented key ceremony. SLH-DSA (FIPS 205) is the candidate for long-lived root keys.
-2. Real authenticated transport for the BFT protocol (done in simulation), using the hybrid KEM for validator links. Then deployment tests across separate sites.
+2. Multi-site deployment tests of `verify-node` over real networks (single-machine multi-process tests are done), then connection rate limiting and a transaction submission API.
 3. Persistent storage, checkpoints, and independent witness checkpoints held by separate operators.
 4. A sanitized, one-way export path for certified historical data feeding the isolated AI gateway (§8.4), with no reverse API.
 5. Coverage-guided fuzzing (cargo-fuzz) of the codec and state machine, reproducible builds and signed releases (§6.4).
